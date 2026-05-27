@@ -33,6 +33,20 @@ _DEFAULT_FIELDS: tuple[str, ...] = ("model", "context_pct", "cwd")
 _SEP = " · "
 
 
+def _format_response_time(seconds: float | None) -> str:
+    if seconds is None:
+        return ""
+    return f"{seconds:.1f}s"
+
+
+def _format_tokens(context_tokens: int, completion_tokens: int | None) -> str:
+    if context_tokens <= 0:
+        return ""
+    if completion_tokens and completion_tokens > 0:
+        return f"{context_tokens}+{completion_tokens}"
+    return str(context_tokens)
+
+
 def _home_relative_cwd(cwd: str) -> str:
     """Return *cwd* with ``$HOME`` collapsed to ``~``.  Empty string if unset."""
     if not cwd:
@@ -95,12 +109,14 @@ def format_runtime_footer(
     context_tokens: int,
     context_length: Optional[int],
     cwd: Optional[str] = None,
+    response_time: Optional[float] = None,
+    completion_tokens: Optional[int] = None,
     fields: Iterable[str] = _DEFAULT_FIELDS,
 ) -> str:
     """Render the footer line, or return "" if no fields have data.
 
     Fields are skipped silently when their underlying data is missing — a
-    partially-populated footer is better than a line with ``?%`` or empty slots.
+    partially-populated footer is better than a line with "?%" or empty slots.
     """
     parts: list[str] = []
     for field in fields:
@@ -112,10 +128,27 @@ def format_runtime_footer(
             if context_length and context_length > 0 and context_tokens >= 0:
                 pct = max(0, min(100, round((context_tokens / context_length) * 100)))
                 parts.append(f"{pct}%")
+        elif field == "response_time":
+            t = _format_response_time(response_time)
+            if t:
+                parts.append(t)
+        elif field == "tokens":
+            t = _format_tokens(context_tokens, completion_tokens)
+            if t:
+                parts.append(t)
         elif field == "cwd":
             rel = _home_relative_cwd(cwd or os.environ.get("TERMINAL_CWD", ""))
             if rel:
                 parts.append(rel)
+        elif field == "context_limit":
+            if context_length and context_length > 0:
+                raw = int(context_length)
+                if raw >= 1_000_000:
+                    parts.append(f"{raw / 1_000_000:.0f}M")
+                elif raw >= 1_000:
+                    parts.append(f"{raw / 1_000:.0f}K")
+                else:
+                    parts.append(str(raw))
         # Unknown field names are silently ignored.
 
     if not parts:
@@ -131,6 +164,8 @@ def build_footer_line(
     context_tokens: int,
     context_length: Optional[int],
     cwd: Optional[str] = None,
+    response_time: Optional[float] = None,
+    completion_tokens: Optional[int] = None,
 ) -> str:
     """Top-level entry point used by gateway/run.py.
 
@@ -146,5 +181,7 @@ def build_footer_line(
         context_tokens=context_tokens,
         context_length=context_length,
         cwd=cwd,
+        response_time=response_time,
+        completion_tokens=completion_tokens,
         fields=cfg.get("fields") or _DEFAULT_FIELDS,
     )

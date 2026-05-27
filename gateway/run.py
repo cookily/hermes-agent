@@ -8100,6 +8100,14 @@ class GatewayRunner:
 
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
+        # HERMES_LARK_START_BEGIN
+        try:
+            from hermes_lark_streaming.patch import on_message_started
+            _lark_message_id = self._reply_anchor_for_event(event) or event.message_id
+            on_message_started(message_id=_lark_message_id, chat_id=source.chat_id)
+        except Exception:
+            pass
+        # HERMES_LARK_START_END
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         _msg_preview = (event.text or "")[:80].replace("\n", " ")
@@ -8734,6 +8742,13 @@ class GatewayRunner:
                     )
                 elif _stale_adapter and hasattr(_stale_adapter, "_post_delivery_callbacks"):
                     _stale_adapter._post_delivery_callbacks.pop(_quick_key, None)
+                # HERMES_LARK_ABORT_BEGIN
+                try:
+                    from hermes_lark_streaming.patch import on_message_aborted
+                    on_message_aborted(message_id=event.message_id)
+                except Exception:
+                    pass
+                # HERMES_LARK_ABORT_END
                 return None
 
             response = agent_result.get("final_response") or ""
@@ -8820,6 +8835,7 @@ class GatewayRunner:
             _footer_line = ""
             try:
                 from gateway.runtime_footer import build_footer_line as _bfl
+                _completion = agent_result.get("last_completion_tokens", 0) or 0
                 _footer_line = _bfl(
                     user_config=_load_gateway_config(),
                     platform_key=_platform_config_key(source.platform),
@@ -8827,6 +8843,8 @@ class GatewayRunner:
                     context_tokens=agent_result.get("last_prompt_tokens", 0) or 0,
                     context_length=agent_result.get("context_length") or None,
                     cwd=os.environ.get("TERMINAL_CWD", ""),
+                    response_time=_response_time,
+                    completion_tokens=_completion,
                 )
             except Exception as _footer_err:
                 logger.debug("runtime_footer build failed: %s", _footer_err)
@@ -9040,6 +9058,29 @@ class GatewayRunner:
             )
 
             # Auto voice reply: send TTS audio before the text response
+            # HERMES_LARK_COMPLETE_BEGIN
+            try:
+                from hermes_lark_streaming.patch import on_message_completed
+                _lark_message_id = self._reply_anchor_for_event(event) or event.message_id
+                _lark_card_sent = on_message_completed(
+                    message_id=_lark_message_id,
+                    answer=response,
+                    duration=_response_time,
+                    model=agent_result.get('model', ''),
+                    tokens={
+                        'input_tokens': agent_result.get('input_tokens', 0),
+                        'output_tokens': agent_result.get('output_tokens', 0),
+                    },
+                    context={
+                        'used_tokens': agent_result.get('last_prompt_tokens', 0),
+                        'max_tokens': agent_result.get('context_length', 0),
+                    },
+                )
+                if _lark_card_sent:
+                    agent_result['already_sent'] = True
+            except Exception:
+                pass
+            # HERMES_LARK_COMPLETE_END
             _already_sent = bool(agent_result.get("already_sent"))
             if self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent):
                 await self._send_voice_reply(event, response)
@@ -15893,6 +15934,20 @@ class GatewayRunner:
 
         def progress_callback(event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
             """Callback invoked by agent on tool lifecycle events."""
+            # HERMES_LARK_TOOL_BEGIN
+            try:
+                from hermes_lark_streaming.patch import on_tool_updated
+                if _run_still_current() and event_type in ('tool.started', 'tool.completed'):
+                    if on_tool_updated(
+                        message_id=event_message_id,
+                        tool_name=tool_name or '',
+                        status='started' if event_type == 'tool.started' else 'completed',
+                        detail=preview or '',
+                    ):
+                        return
+            except Exception:
+                pass
+            # HERMES_LARK_TOOL_END
             if not progress_queue or not _run_still_current():
                 return
 
@@ -16576,6 +16631,14 @@ class GatewayRunner:
                         )
                         if _want_stream_deltas:
                             def _stream_delta_cb(text: str) -> None:
+                                # HERMES_LARK_ANSWER_BEGIN
+                                try:
+                                    from hermes_lark_streaming.patch import on_answer_delta
+                                    if text and _run_still_current() and on_answer_delta(message_id=event_message_id, text=text):
+                                        return
+                                except Exception:
+                                    pass
+                                # HERMES_LARK_ANSWER_END
                                 if _run_still_current():
                                     _stream_consumer.on_delta(text)
                         stream_consumer_holder[0] = _stream_consumer
@@ -16583,6 +16646,15 @@ class GatewayRunner:
                     logger.debug("Could not set up stream consumer: %s", _sc_err)
 
             def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
+                # HERMES_LARK_THINKING_BEGIN
+                try:
+                    from hermes_lark_streaming.patch import on_thinking_delta
+                    if (text and not already_streamed and _run_still_current()
+                            and on_thinking_delta(message_id=event_message_id, text=text)):
+                        return
+                except Exception:
+                    pass
+                # HERMES_LARK_THINKING_END
                 if not _run_still_current():
                     return
                 if _stream_consumer is not None:
@@ -16681,6 +16753,16 @@ class GatewayRunner:
             agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
             agent.status_callback = _status_callback_sync
             agent.reasoning_config = reasoning_config
+            # HERMES_LARK_REASONING_BEGIN
+            def _reasoning_cb(text):
+                if text and _run_still_current():
+                    try:
+                        from hermes_lark_streaming.patch import on_reasoning_delta
+                        on_reasoning_delta(message_id=event_message_id, text=text)
+                    except Exception:
+                        pass
+            agent.reasoning_callback = _reasoning_cb
+            # HERMES_LARK_REASONING_END
             agent.service_tier = self._service_tier
             agent.request_overrides = turn_route.get("request_overrides") or {}
 
@@ -16722,6 +16804,22 @@ class GatewayRunner:
                 _deliver_bg_review_message(message)
 
             agent.background_review_callback = _bg_review_send
+            # HERMES_LARK_BACKGROUND_REVIEW_BEGIN
+            try:
+                from hermes_lark_streaming.patch import on_background_review_message
+                _lark_bg_review_sender = agent.background_review_callback
+                def _lark_bg_review_callback(message):
+                    _lark_bg_review_deferred = on_background_review_message(
+                        message_id=event_message_id,
+                        text=message,
+                        sender=_lark_bg_review_sender,
+                    )
+                    if not _lark_bg_review_deferred:
+                        _lark_bg_review_sender(message)
+                agent.background_review_callback = _lark_bg_review_callback
+            except Exception:
+                pass
+            # HERMES_LARK_BACKGROUND_REVIEW_END
             # Register the release hook on the adapter so base.py's finally
             # block can fire it after delivering the main response.
             if _status_adapter and session_key:
@@ -17821,6 +17919,18 @@ class GatewayRunner:
                     next_message_id = self._reply_anchor_for_event(pending_event)
                     next_channel_prompt = getattr(pending_event, "channel_prompt", None)
 
+                # HERMES_LARK_INTERRUPT_BEGIN
+                try:
+                    from hermes_lark_streaming.patch import on_message_interrupted
+                    if was_interrupted and next_message_id:
+                        on_message_interrupted(
+                            message_id=event_message_id,
+                            new_message_id=next_message_id,
+                            chat_id=source.chat_id,
+                        )
+                except Exception:
+                    pass
+                # HERMES_LARK_INTERRUPT_END
                 # Restart typing indicator so the user sees activity while
                 # the follow-up turn runs.  The outer _process_message_background
                 # typing task is still alive but may be stale.

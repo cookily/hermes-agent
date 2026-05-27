@@ -38,6 +38,7 @@ import tempfile
 import threading
 import time
 import sqlite3
+import contextlib
 from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
@@ -5446,21 +5447,21 @@ class GatewayRunner:
                 )
                 disabled_corrupt_boards.pop(slug, None)
             try:
-                conn = _kb.connect(board=slug)
-                # `connect()` runs the schema + idempotent migration on
-                # first open per process; the previous explicit
-                # `init_db()` call here busted the per-process cache and
-                # re-ran the migration on a second connection, racing
-                # the first. See the matching comment in
-                # `_kanban_notifier_watcher` and issue #21378.
-                return _kb.dispatch_once(
-                    conn,
-                    board=slug,
-                    max_spawn=max_spawn,
-                    max_in_progress=max_in_progress,
-                    failure_limit=failure_limit,
-                    stale_timeout_seconds=stale_timeout_seconds,
-                )
+                with contextlib.closing(_kb.connect(board=slug)) as conn:
+                    # `connect()` runs the schema + idempotent migration on
+                    # first open per process; the previous explicit
+                    # `init_db()` call here busted the per-process cache and
+                    # re-ran the migration on a second connection, racing
+                    # the first. See the matching comment in
+                    # `_kanban_notifier_watcher` and issue #21378.
+                    return _kb.dispatch_once(
+                        conn,
+                        board=slug,
+                        max_spawn=max_spawn,
+                        max_in_progress=max_in_progress,
+                        failure_limit=failure_limit,
+                        stale_timeout_seconds=stale_timeout_seconds,
+                    )
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):
                     disabled_corrupt_boards[slug] = fingerprint
@@ -5479,12 +5480,6 @@ class GatewayRunner:
             except Exception:
                 logger.exception("kanban dispatcher: tick failed on board %s", slug)
                 return None
-            finally:
-                if conn is not None:
-                    try:
-                        conn.close()
-                    except Exception:
-                        pass
 
         def _tick_once() -> "list[tuple[str, Optional[object]]]":
             """Run one dispatch_once per board. Returns (slug, result) pairs.
